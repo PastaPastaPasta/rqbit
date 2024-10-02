@@ -1,9 +1,8 @@
 use std::{
     io::Write,
     marker::PhantomData,
-    net::{Ipv4Addr, SocketAddrV4},
 };
-
+use std::net::{IpAddr, SocketAddr};
 use bencode::{ByteBuf, ByteBufOwned};
 use bytes::Bytes;
 use clone_to_owned::CloneToOwned;
@@ -166,7 +165,7 @@ struct RawMessage<BufT, Args = IgnoredAny, Resp = IgnoredAny> {
 
 pub struct Node {
     pub id: Id20,
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 impl core::fmt::Debug for Node {
@@ -193,7 +192,10 @@ impl Serialize for CompactNodeInfo {
         let mut buf = Vec::<u8>::with_capacity(self.nodes.len() * 26);
         for node in self.nodes.iter() {
             buf.extend_from_slice(&node.id.0);
-            let ip_octets = node.addr.ip().octets();
+            let ip_octets = match node.addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
             let port = node.addr.port();
             buf.extend_from_slice(&ip_octets);
             // BE encoding for port.
@@ -214,25 +216,45 @@ impl<'de> Deserialize<'de> for CompactNodeInfo {
             type Value = CompactNodeInfo;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                write!(formatter, "compact node info with length multiple of 26")
+                write!(formatter, "a series of compact node info")
             }
             fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                if v.len() % 26 != 0 {
-                    return Err(E::invalid_length(v.len(), &self));
-                }
-                let mut buf = Vec::<Node>::with_capacity(v.len() / 26);
-                for chunk in v.chunks_exact(26) {
-                    let mut node_id = [0u8; 20];
-                    node_id.copy_from_slice(&chunk[..20]);
-                    let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
-                    let port = ((chunk[24] as u16) << 8) + chunk[25] as u16;
+                let mut buf = Vec::<Node>::new();
+                let mut i = 0;
+                while i < v.len() {
+                    if v.len() < i + 20 + 2 { // Ensure there's enough room for an ID and port
+                        return Err(E::invalid_length(v.len(), &self));
+                    }
+                    let node_id = {
+                        let mut id = [0u8; 20];
+                        id.copy_from_slice(&v[i..i+20]);
+                        Id20::new(id)
+                    };
+                    i += 20;
+                    let (ip, ip_size) = if v.len() >= i + 16 + 2 && v[i..i+16].iter().any(|&b| b != 0) {
+                        // Attempt to parse as IPv6 if possible
+                        let ip_addr = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&v[i..i+16]).unwrap());
+                        (IpAddr::V6(ip_addr), 16)
+                    } else if v.len() >= i + 4 + 2 {
+                        // Fallback to IPv4
+                        let ip_addr = std::net::Ipv4Addr::new(v[i], v[i+1], v[i+2], v[i+3]);
+                        (IpAddr::V4(ip_addr), 4)
+                    } else {
+                        return Err(E::invalid_length(v.len(), &self));
+                    };
+                    i += ip_size;
+                    if v.len() < i + 2 {
+                        return Err(E::invalid_length(v.len(), &self));
+                    }
+                    let port = ((v[i] as u16) << 8) + v[i+1] as u16;
+                    i += 2;
                     buf.push(Node {
-                        id: Id20::new(node_id),
-                        addr: SocketAddrV4::new(ip, port),
-                    })
+                        id: node_id,
+                        addr: SocketAddr::new(ip, port),
+                    });
                 }
                 Ok(CompactNodeInfo { nodes: buf })
             }
@@ -242,7 +264,7 @@ impl<'de> Deserialize<'de> for CompactNodeInfo {
 }
 
 pub struct CompactPeerInfo {
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
 }
 
 impl core::fmt::Debug for CompactPeerInfo {
@@ -256,16 +278,15 @@ impl Serialize for CompactPeerInfo {
     where
         S: serde::Serializer,
     {
-        let octets = self.addr.ip().octets();
+        let ip_octets = match self.addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
         let port = self.addr.port();
-        let buf = [
-            octets[0],
-            octets[1],
-            octets[2],
-            octets[3],
-            (port >> 8) as u8,
-            (port & 0xff) as u8,
-        ];
+        let mut buf = Vec::with_capacity(ip_octets.len() + 2);
+        buf.extend_from_slice(&ip_octets);
+        buf.push((port >> 8) as u8);
+        buf.push((port & 0xff) as u8);
         serializer.serialize_bytes(&buf)
     }
 }
@@ -280,19 +301,25 @@ impl<'de> Deserialize<'de> for CompactPeerInfo {
             type Value = CompactPeerInfo;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                write!(formatter, "6 bytes of peer info")
+                write!(formatter, "IP address and port information")
             }
+
             fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                if v.len() != 6 {
-                    return Err(E::invalid_length(6, &self));
-                }
-                let ip = Ipv4Addr::new(v[0], v[1], v[2], v[3]);
-                let port = ((v[4] as u16) << 8) + v[5] as u16;
+                let ip = if v.len() == 18 { // IPv6 addresses are 16 bytes + 2 bytes port
+                    let ip_addr = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&v[0..16]).map_err(|_| E::custom("Invalid IPv6 address"))?);
+                    Ok(std::net::IpAddr::V6(ip_addr))
+                } else if v.len() == 6 { // IPv4 addresses are 4 bytes + 2 bytes port
+                    let ip_addr = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&v[0..4]).map_err(|_| E::custom("Invalid IPv4 address"))?);
+                    Ok(std::net::IpAddr::V4(ip_addr))
+                } else {
+                    Err(E::invalid_length(6, &self))
+                }?;
+                let port = ((v[v.len()-2] as u16) << 8) + v[v.len()-1] as u16;
                 Ok(CompactPeerInfo {
-                    addr: SocketAddrV4::new(ip, port),
+                    addr: SocketAddr::new(ip, port),
                 })
             }
         }
@@ -354,7 +381,7 @@ pub struct Message<BufT> {
     pub kind: MessageKind<BufT>,
     pub transaction_id: BufT,
     pub version: Option<BufT>,
-    pub ip: Option<SocketAddrV4>,
+    pub ip: Option<SocketAddr>,
 }
 
 impl Message<ByteBufOwned> {
@@ -394,7 +421,7 @@ pub fn serialize_message<'a, W: Write, BufT: Serialize + From<&'a [u8]>>(
     writer: &mut W,
     transaction_id: BufT,
     version: Option<BufT>,
-    ip: Option<SocketAddrV4>,
+    ip: Option<SocketAddr>,
     kind: MessageKind<BufT>,
 ) -> anyhow::Result<()> {
     let ip = ip.map(|ip| CompactPeerInfo { addr: ip });

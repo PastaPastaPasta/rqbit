@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    net::{SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     str::FromStr,
     sync::atomic::AtomicU32,
 };
@@ -28,7 +28,7 @@ struct StoredToken {
 
 #[derive(Serialize, Deserialize)]
 struct StoredPeer {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     time: DateTime<Utc>,
 }
 
@@ -139,13 +139,7 @@ impl PeerStore {
         // If the token doesn't match, don't store it.
         // If we are out of capacity, don't store it.
         // Otherwise, store it.
-        let mut addr = match addr {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => {
-                trace!("peer store: IPv6 not supported");
-                return false;
-            }
-        };
+        let mut addr = addr;
 
         if announce.info_hash.distance(&self.self_id) > self.max_distance {
             trace!("peer store: info_hash too far to store");
@@ -153,7 +147,7 @@ impl PeerStore {
         }
         if !self.tokens.read().iter().any(|t| {
             t.token[..] == announce.token[..]
-                && t.addr == std::net::SocketAddr::V4(addr)
+                && t.addr == addr
                 && t.node_id == announce.id
         }) {
             trace!("peer store: can't find this token / addr combination");

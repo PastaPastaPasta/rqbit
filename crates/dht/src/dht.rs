@@ -421,13 +421,13 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
 
         if let Some(peers) = response.values {
             for peer in peers {
-                self.peer_tx.send(SocketAddr::V4(peer.addr))?;
+                self.peer_tx.send(peer.addr)?;
             }
         }
 
         if let Some(nodes) = response.nodes {
             for node in nodes.nodes {
-                let addr = SocketAddr::V4(node.addr);
+                let addr = node.addr;
                 let should_request = self.should_request_node(node.id, addr, depth);
                 trace!(
                     "should_request={}, id={:?}, addr={}, depth={}/{}",
@@ -670,10 +670,7 @@ impl DhtState {
                 .filter_map(|r| {
                     Some(Node {
                         id: r.id(),
-                        addr: match r.addr() {
-                            SocketAddr::V4(v4) => v4,
-                            SocketAddr::V6(_) => return None,
-                        },
+                        addr: r.addr()
                     })
                 })
                 .take(8)
